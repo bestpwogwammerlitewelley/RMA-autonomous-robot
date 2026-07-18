@@ -11,7 +11,6 @@ containerized with Docker, and version-controlled on GitHub.
 - **T3 (Olaf)** — TBD
 
 ## Plan — Tiered goals (10-days, + possible August follow-on week) 
-- (all from CLAUDE)
 
 **Tier 0 — Guaranteed (Day 7)**
 - Chassis assembled, motors + caster + power wired
