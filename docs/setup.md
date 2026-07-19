@@ -19,3 +19,20 @@
 - `root@...` prompt = inside the container: `ros2` and `source` commands go here.
 - Every NEW shell inside the container needs `source /opt/ros/humble/setup.bash` first.
 - Container already exists next time? Use `docker start -ai ros2` instead of `docker run`.
+
+## ESP32 setup (Arduino IDE, Windows)
+
+1. Install Arduino IDE 2.x (arduino.cc)
+2. USB driver: our boards use CP2102 → download "CP210x Universal Windows Driver"
+   from Silabs, extract, right-click the `silabser` (Setup Information) file → Install.
+   Then plug in ESP32 → a COM port appears in Device Manager → Ports.
+3. IDE: File → Preferences → Additional boards URL:
+   https://espressif.github.io/arduino-esp32/package_esp32_index.json
+   Then Tools → Board → Boards Manager → install "esp32 by Espressif".
+4. Tools → Board → ESP32 Dev Module; Tools → Port → your COM port.
+5. Test upload: Blink example. Gotchas:
+   - Add `#define LED_BUILTIN 2` at the top (not defined for this board)
+   - If stuck at "Connecting...", hold the BOOT button on the board
+   - Our clone boards have no visible program LED — use a Serial.println
+     sketch + Serial Monitor at 115200 baud to verify instead.
+   - IDE saying "offline" is harmless (cloud status only).
