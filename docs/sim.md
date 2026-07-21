@@ -1,32 +1,34 @@
 # Simulation Environment — Setup & Reproduction Guide
 
-Development guide for the sim environment of the RMA autonomous robot. This document lets
-anyone stand up the TurtleBot3 simulation from scratch, run the
+Development guide for the sim environment of the RMA autonomous robot. This
+document lets anyone stand up the TurtleBot3 simulation from scratch, run the
 obstacle-avoidance node, and run autonomous point-to-point navigation with SLAM +
 Nav2 in Gazebo (without hardware).
 
-The simulation exists to prove the autonomy logic of the code (obstacle avoidance, mapping,
-navigation), intended to be done before and independently of the physical robot, as thought out in the project's
-sim-first workflow.
+The simulation exists to prove the autonomy logic of the code (obstacle
+avoidance, mapping, navigation), intended to be done before and independently of
+the physical robot, as thought out in the project's sim-first workflow.
 
 ---
 
 ## 1. Scope & design contract
 
 The simulated robot is a stand-in for the real 2WD differential-drive robot. It is
-not a URDF-accurate model of our hardware, and that is intentional for this
+**not** a URDF-accurate model of our hardware, and that is intentional for this
 phase — proving the control logic matters more than a matching chassis. A custom
 URDF is a planned later upgrade.
 
 The one hard design rule the sim enforces:
 
-> The obstacle-avoidance node depends only on the scan topic
+> The obstacle-avoidance node depends **only** on the scan topic
 > (`sensor_msgs/msg/LaserScan`) and the velocity topic (`/cmd_vel`). It contains
-> no TurtleBot3-specific dependencies.
+> **no** TurtleBot3-specific or sensor-specific code.
 
 This is what allows the same node to run unchanged on the real robot as its
-rangefinder evolves (HC-SR04 ultrasonic → TFmini-S ToF → lidar), because each
-sensor publishes the same message types.
+rangefinder evolves (HC-SR04 ultrasonic array → TFmini-S sweep → lidar), because
+each publishes the same `LaserScan` message type. The only cross-environment
+difference — the `/cmd_vel` message type — is handled by a runtime parameter
+(see §5.2), not by forking the code.
 
 ---
 
@@ -35,8 +37,8 @@ sensor publishes the same message types.
 | Component | Version / value | Notes |
 |-----------|-----------------|-------|
 | OS | Ubuntu 24.04 | |
-| ROS 2 | **Jazzy** | Native install. The real robot targets Humble — see §9. |
-| Simulator | Gazebo (new "Gz Sim", not Gazebo Classic) | Installed with `ros_gz` |
+| ROS 2 (sim) | **Jazzy** | Native install. The real robot runs Humble — see §9. |
+| Simulator | Gazebo (new "Gz Sim", **not** Gazebo Classic) | Installed with `ros_gz` |
 | Robot model | TurtleBot3 **burger** | |
 | Workspace | `~/RMA-autonomous-robot/ros2_ws` | Colcon workspace inside the repo |
 
@@ -62,9 +64,9 @@ source ~/RMA-autonomous-robot/ros2_ws/install/setup.bash
 export TURTLEBOT3_MODEL=burger
 ```
 
-> **Note:** `~/.bashrc` changes only affect terminals opened after the edit.
-> If `TURTLEBOT3_MODEL` is unset in the terminal that launches Gazebo, no robot
-> spawns (see §8). When in doubt, `export TURTLEBOT3_MODEL=burger` explicitly
+> **Note:** `~/.bashrc` changes only affect terminals opened *after* the edit.
+> If `TURTLEBOT3_MODEL` is unset in the terminal that launches Gazebo, **no robot
+> spawns** (see §8). When in doubt, `export TURTLEBOT3_MODEL=burger` explicitly
 > before launching.
 
 ---
@@ -93,7 +95,7 @@ RMA-autonomous-robot/
 ## 4. Building the workspace
 
 Run from the workspace root. **Required after every edit to `avoider.py`** — `ros2 run`
-executes the installed copy, not the source file, so an unbuilt edit has no effect.
+executes the *installed* copy, not the source file, so an un-built edit has no effect.
 
 ```bash
 cd ~/RMA-autonomous-robot/ros2_ws
@@ -119,40 +121,57 @@ and other topics publish (see §8.2).
 than `turtlebot3_house` because the current avoidance logic can become trapped in
 the tight room corners of the house world. See §7 for hardening notes.
 
-**Terminal 2 — Avoider node**
+**Terminal 2 — Avoider node (sim requires the stamped flag — see §5.2)**
 ```bash
-ros2 run obstacle_avoidance avoider
+ros2 run obstacle_avoidance avoider --ros-args -p use_stamped_cmd_vel:=true
 ```
 
-Expected: the log prints `Obstacle avoider started` and the robot begins driving
-forward, stopping and rotating when an obstacle enters the front arc.
+Expected: the log prints `Obstacle avoider started (cmd_vel type: TwistStamped)`
+and the robot begins driving forward, stopping and turning when an obstacle enters
+the front arc.
 
 ### 5.1 Node behaviour
 
-`avoider.py` subscribes to `/scan` and publishes to `/cmd_vel`:
+`avoider.py` subscribes to `/scan` (`sensor_msgs/LaserScan`) and publishes to
+`/cmd_vel`. Logic:
 
-- Samples the front arc of the `LaserScan`, filtering invalid returns
-  (`inf`, and values outside `[0.1, 3.5]` m).
-- If the minimum valid front distance `< 0.4 m`: set `linear.x = 0`, `angular.z`
-  to a fixed turn rate (rotate in place until clear).
-- Otherwise: drive forward at the configured `linear.x`, `angular.z = 0`.
+- Sectors the scan **by angle** (not fixed array indices), so it works for any
+  scan resolution — the sim lidar's hundreds of beams or the hardware's 5-beam
+  ultrasonic fan.
+- Front cone = `front_arc` degrees either side of straight ahead; if the minimum
+  valid distance there `< stop_distance`, an obstacle is ahead.
+- On obstacle: compares left-sector vs right-sector clearance and turns toward the
+  more open side (clearance-based turning, avoids corner oscillation).
+- Otherwise: drives forward.
 
-### 5.2 `/cmd_vel` message type — critical
+Tunable parameters at the top of the node: `forward_speed`, `turn_speed`,
+`stop_distance`, `front_arc`, `side_arc`.
 
-TurtleBot3 on **Jazzy** expects **`geometry_msgs/msg/TwistStamped`** on `/cmd_vel`,
-**not** plain `Twist`. The node publishes `TwistStamped`: it stamps
-`cmd.header.stamp` with the current time and nests velocities under `cmd.twist.*`
-(e.g. `cmd.twist.linear.x`).
+### 5.2 `/cmd_vel` message type — the `use_stamped_cmd_vel` parameter (critical)
 
-Symptom if this is wrong: `ros2 topic echo /cmd_vel` fails with
-`contains more than one type: [Twist, TwistStamped]`, and the robot does not move.
+Whether `/cmd_vel` carries `geometry_msgs/Twist` or `geometry_msgs/TwistStamped`
+is a property of whatever **consumes** `/cmd_vel`, **not** of the ROS distro. The
+node selects the type at launch via the `use_stamped_cmd_vel` parameter:
+
+| Environment | Consumer of `/cmd_vel` | Required type | Parameter |
+|-------------|------------------------|---------------|-----------|
+| **Sim** (Jazzy) | Gazebo / TurtleBot3 bridge | `TwistStamped` | `use_stamped_cmd_vel:=true` |
+| **Hardware** (Humble) | our ESP32 motor bridge | `Twist` | `use_stamped_cmd_vel:=false` *(default)* |
+
+**Team rule: sim = TwistStamped, hardware = Twist. Any node that must work in both
+takes the flag.** The default is `false` (plain `Twist`) for the real robot; in
+sim you must pass `use_stamped_cmd_vel:=true`.
+
+> If the robot does not move in sim and the log shows `cmd_vel type: Twist`, you
+> forgot the flag — the Gazebo bridge is waiting for `TwistStamped` and silently
+> dropping plain `Twist`. Re-run with `--ros-args -p use_stamped_cmd_vel:=true`.
 
 ### 5.3 Velocity ceiling
 
 The TurtleBot3 burger is capped at **~0.22 m/s** in its model configuration. The
 Gazebo diff-drive controller clamps any higher `linear.x` back to this limit, so
-raising the value in `avoider.py` above ~0.22 has no visible effect in sim. This
-cap is a burger-model artifact and does not apply to the real robot.
+raising `forward_speed` above ~0.22 has no visible effect in sim. This cap is a
+burger-model artifact and does not apply to the real robot.
 
 ---
 
@@ -196,7 +215,7 @@ ros2 launch nav2_bringup navigation_launch.py \
   autostart:=True \
   params_file:=/home/<user>/RMA-autonomous-robot/ros2_ws/nav2_params.yaml
 ```
-Wait for the log line `Managed nodes are active`. Use an absolute path for
+Wait for the log line `Managed nodes are active`. Use an **absolute path** for
 `params_file:=` — a leading `~` is not expanded inside launch arguments.
 
 **Terminal 4 — RViz**
@@ -208,22 +227,23 @@ Add displays via **Add → By topic**: `/map` (Map), `/scan` (LaserScan), and
 
 **Terminal 5 (optional) — Avoider, to build the map autonomously**
 ```bash
-ros2 run obstacle_avoidance avoider
+ros2 run obstacle_avoidance avoider --ros-args -p use_stamped_cmd_vel:=true
 ```
-Let the robot roam to populate the map, then stop the avoider (`Ctrl+C`)
+Let the robot roam to populate the map, then **stop the avoider** (`Ctrl+C`)
 before issuing Nav2 goals — see §6.5.
 
 ### 6.3 Nav2 parameters — the `enable_stamped_cmd_vel` fix (critical)
 
-By default, Nav2's velocity publishers (`collision_monitor` is the final publisher
-in the chain, plus `controller_server`, `velocity_smoother`, `docking_server`)
-emit plain **`geometry_msgs/msg/Twist`**. The `ros_gz_bridge` subscribes as
-**`TwistStamped`**. The types do not match, so the bridge silently drops every
-command: Nav2 plans a path, believes it is driving, but the robot never moves and
-the goal terminates in **`ABORTED`** (with `error_code: 0`).
+This is the Nav2-side counterpart of §5.2. By default, Nav2's velocity publishers
+(`collision_monitor` is the final publisher in the chain, plus `controller_server`,
+`velocity_smoother`, `docking_server`) emit plain **`geometry_msgs/msg/Twist`**.
+The Gazebo `ros_gz_bridge` subscribes as **`TwistStamped`**. The types do not
+match, so the bridge silently drops every command: Nav2 plans a path, believes it
+is driving, but the robot never moves and the goal terminates in **`ABORTED`**
+(with `error_code: 0`).
 
 **Fix:** a params override sets `enable_stamped_cmd_vel: true` on the relevant
-nodes so Nav2 publishes `TwistStamped`.
+Nav2 nodes so Nav2 publishes `TwistStamped`.
 
 Generate the params file (one-time):
 ```bash
@@ -243,6 +263,10 @@ set it to `true` rather than duplicating):
 > Setting this parameter **live** via `ros2 param set` does **not** work — the
 > publisher is created at node initialization, so the parameter must be present at
 > launch. It must come from the params file.
+>
+> Note: this Nav2 fix is **sim-only**. On the Humble robot, Nav2 (if used) drives
+> the motor bridge, which expects plain `Twist`, so this override is not applied
+> there. It exists purely to match the Jazzy Gazebo bridge.
 
 ### 6.4 Issuing navigation goals
 
@@ -266,26 +290,23 @@ run; stop it (`Ctrl+C`) before issuing Nav2 goals. Nav2 performs its own obstacl
 avoidance while navigating.
 
 If the robot spins uncontrollably immediately after the avoider is killed, the
-last (turn) command has been left latched. Publish a single zero command to stop
-it, or simply issue a Nav2 goal to take over:
-```bash
-ros2 topic pub --once /cmd_vel geometry_msgs/msg/TwistStamped \
-  "{twist: {linear: {x: 0.0}, angular: {z: 0.0}}}"
-```
+last (turn) command has been left latched. The reliable handover is: **pause the
+Gazebo sim → `Ctrl+C` the avoider → unpause → issue the Nav2 goal**. Pausing
+freezes the robot in place before it can drift into a wall. (Do **not** *move* the
+robot while paused — see §8.7.)
 
 ---
 
 ## 7. Known limitation — avoidance logic in tight spaces
 
-The current avoider samples only a narrow front arc and always turns in a fixed
-direction at a fixed rate. In tight concave corners this can oscillate (turn →
-see adjacent wall → turn back), trapping the robot. This is why `turtlebot3_world`
-is the recommended test world rather than `turtlebot3_house`.
+The avoider samples a front cone and turns toward the more open side, which
+handles most obstacles and simple corners. In very tight concave corners it can
+still oscillate. This is why `turtlebot3_world` is the recommended test world
+rather than `turtlebot3_house`.
 
-Planned hardening (before hardware integration):
-- Widen the sampled front arc.
-- Choose turn direction by comparing left- vs right-side clearance and turning
-  toward the more open side, rather than always turning the same way.
+Planned hardening (future):
+- Widen `front_arc` if corner-clipping is observed.
+- Add a recovery behaviour for the "boxed in on all sides" case (e.g. reverse).
 
 ---
 
@@ -309,14 +330,19 @@ in Gazebo, then re-check. Confirm the robot is fully up with:
 ros2 topic echo /odom --once
 ```
 
-### 8.3 Nav2 goal accepted but robot does not move (`ABORTED`)
-`/cmd_vel` type mismatch. Confirm:
-```bash
-ros2 topic info /cmd_vel --verbose
-```
-If Nav2 publishers show `geometry_msgs/msg/Twist` while `ros_gz_bridge` subscribes
-as `geometry_msgs/msg/TwistStamped`, apply the §6.3 params fix and relaunch Nav2.
-After the fix, `collision_monitor` must show `TwistStamped`.
+### 8.3 Robot does not move (sim) — `/cmd_vel` type mismatch
+Two independent causes, both the same root issue (see §5.2 and §6.3):
+
+* **Avoider:** launched without `use_stamped_cmd_vel:=true`. The log shows
+  `cmd_vel type: Twist`; re-run with the flag.
+* **Nav2:** goal is accepted but the robot never moves and the goal ends
+  `ABORTED` — the `enable_stamped_cmd_vel` params fix is not active. Confirm with:
+  ```bash
+  ros2 topic info /cmd_vel --verbose
+  ```
+  All publishers and the `ros_gz_bridge` subscriber must show
+  `geometry_msgs/msg/TwistStamped`. If a publisher shows `Twist`, apply §6.3 (or
+  the avoider flag) and relaunch.
 
 ### 8.4 Nav2 container dies on startup (`exit code -11`)
 Segfault in the combined isolated-container bringup at `route_server`. Use the
@@ -338,9 +364,10 @@ A printed transform confirms SLAM is publishing and the robot is localized. A
 
 ### 8.7 SLAM map becomes corrupted / inconsistent
 Do **not** reposition the robot in Gazebo while the simulation is **paused** —
-SLAM does not observe the motion and the map desyncs. To reset the map, restart
-the SLAM Toolbox node; the map lives only in that node's memory and the robot's
-position at launch becomes the new origin `(0, 0)`.
+SLAM does not observe the motion and the map desyncs. Pausing to *stop* the robot
+is fine; *moving* it while paused is what breaks the map. To reset the map,
+restart the SLAM Toolbox node; the map lives only in that node's memory and the
+robot's position at launch becomes the new origin `(0, 0)`.
 
 ### 8.8 Gazebo will not relaunch cleanly after Ctrl+C
 Kill lingering processes before relaunching:
@@ -359,22 +386,56 @@ Confirm nothing remains with `ros2 node list`.
 ## 9. Sim-to-hardware porting notes
 
 The sim runs **ROS 2 Jazzy**; the physical robot runs **ROS 2 Humble** on a
-Raspberry Pi 5. Key considerations when porting:
+Raspberry Pi 5, with an ESP32 handling low-level motor control and sensor timing.
 
-- **Avoidance node:** ports unchanged. It depends only on `LaserScan` and
-  `/cmd_vel`, whose APIs are stable across Jazzy and Humble.
-- **`/cmd_vel` message type:** the `TwistStamped` requirement (§5.2) and the Nav2
-  `enable_stamped_cmd_vel` fix (§6.3) are specific to the Gazebo bridge on Jazzy.
-  The real robot's driver may expect plain `Twist`. **Re-verify the expected
-  `/cmd_vel` type on the Pi** with `ros2 topic info /cmd_vel --verbose` before
-  assuming the sim config transfers.
-- **Sensor message shape:** the sim lidar publishes a multi-point 360° `LaserScan`.
-  The initial hardware sensor (HC-SR04 ultrasonic) produces a **single distance
-  reading** — likely a `sensor_msgs/msg/Range`, or a `LaserScan` with one element.
-  The avoider's front-arc slicing assumes a multi-point scan and must be adapted
-  to handle a single-value message before running on ultrasonic hardware.
-- **Velocity ceiling:** the ~0.22 m/s burger cap (§5.3) is a sim-model artifact
+**What ports unchanged:**
+- **The avoider node.** Its `rclpy` API, and the `LaserScan`/`Twist`/`TwistStamped`
+  message types, are identical across Jazzy and Humble. The same `avoider.py`
+  runs in both environments.
+
+**What differs, and how it is handled:**
+
+- **`/cmd_vel` message type.** Sim (Jazzy Gazebo bridge) needs `TwistStamped`;
+  the robot (Humble, our ESP32 motor bridge) uses plain **`Twist`**. This is a
+  design decision, not a distro fact — Humble's convention is plain `Twist`
+  (`teleop_twist_keyboard`, Nav2, most drivers). Handled by the
+  `use_stamped_cmd_vel` parameter (§5.2): default `false` for hardware, set
+  `true` in sim. No code fork.
+
+- **Sensor → `/scan`.** On the robot, the front sensor array feeds `/scan` as a
+  `LaserScan`, so the avoider is a **drop-in** with no change — this is the whole
+  point of the design contract (§1). The hardware sensor path:
+  - **Sensors:** five HC-SR04 ultrasonics mounted across the front fan at
+    **−90°, −45°, 0°, +45°, +90°**.
+  - **Serial protocol (ESP32 → Pi):** one line per sweep, all five readings,
+    atomic: `U <d0> <d1> <d2> <d3> <d4>\n` (centimetres, `-1` = no echo/timeout).
+    One sweep = one line, to avoid bandwidth cost and timestamp re-sync.
+  - **ROS side:** the Pi-side serial bridge publishes a **single
+    `sensor_msgs/LaserScan` with 5 beams** (not five `Range` topics — that would
+    break the design contract and force a rewrite of the avoider). Fields:
+    `angle_min = −90°`, `angle_max = +90°`, `angle_increment = fan/4`, `ranges` =
+    the five values in metres, `range_min = 0.02`, `range_max = 4.0`, invalid
+    (`-1`) → `inf`, `frame_id` e.g. `laser_frame`. The bridge may *also* publish
+    five `Range` topics for debug visibility, but `LaserScan` is the one the
+    avoider consumes.
+  - **Update rate:** sensors fire **sequentially, never simultaneously** (parallel
+    pings cross-talk — one sensor hears another's echo). ~60 ms/sensor worst case
+    → full sweep ~**5 Hz**. Adequate for avoidance.
+
+- **Resolution.** The sim lidar gives hundreds of beams; the hardware scan gives
+  five. The avoider sectors by **angle**, not fixed indices, so both work without
+  change. Turn-direction quality is coarser with five beams but the logic is
+  identical.
+
+- **Velocity ceiling.** The ~0.22 m/s burger cap (§5.3) is a sim-model artifact
   and does not constrain the real robot.
+
+**Hardware electrical constraints (for the firmware/wiring author, recorded here
+for completeness):** HC-SR04 echo pins output 5 V; the ESP32 is 3.3 V-tolerant
+only, so each echo line needs a divider (1 kΩ/2 kΩ) or level shifter —
+non-optional. Five sensors = 10 GPIOs (trig + echo each); keep clear of the pins
+already used by the TB6612 motor driver (25/26/27/12/13/14) and of
+strapping/input-only pins.
 
 ---
 
@@ -384,7 +445,8 @@ Raspberry Pi 5. Key considerations when porting:
 |------|---------|
 | Build after editing node | `cd ~/RMA-autonomous-robot/ros2_ws && colcon build --packages-select obstacle_avoidance && source install/setup.bash` |
 | Launch world | `ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py` |
-| Run avoider | `ros2 run obstacle_avoidance avoider` |
+| Run avoider (**sim**) | `ros2 run obstacle_avoidance avoider --ros-args -p use_stamped_cmd_vel:=true` |
+| Run avoider (**hardware**) | `ros2 run obstacle_avoidance avoider` |
 | Launch SLAM | `ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true` |
 | Launch Nav2 | `ros2 launch nav2_bringup navigation_launch.py use_sim_time:=True autostart:=True params_file:=<abs_path>/nav2_params.yaml` |
 | Open RViz | `rviz2` |
