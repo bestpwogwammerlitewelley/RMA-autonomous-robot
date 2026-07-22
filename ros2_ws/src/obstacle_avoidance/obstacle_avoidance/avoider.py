@@ -1,68 +1,124 @@
+#!/usr/bin/env python3
+"""
+avoider.py — obstacle-avoidance node.
+
+Subscribes to /scan (sensor_msgs/LaserScan) and publishes velocity commands to
+/cmd_vel. Depends ONLY on the scan message and /cmd_vel, with no sensor-specific
+code, so the SAME node runs unchanged on:
+  * the Gazebo lidar in simulation (hundreds of readings), and
+  * the real robot's five HC-SR04 ultrasonics, fused into a small LaserScan by
+    the serial bridge.
+
+The node adapts to scan resolution (it sectors readings by ANGLE, so 5 beams or
+500 both work) and to the /cmd_vel message type expected by its consumer.
+
+-----------------------------------------------------------------------------
+cmd_vel message type — the `use_stamped_cmd_vel` parameter
+-----------------------------------------------------------------------------
+Whether /cmd_vel carries geometry_msgs/Twist or geometry_msgs/TwistStamped is a
+property of whatever CONSUMES /cmd_vel, not of the ROS distro:
+
+  * SIM   (Jazzy):  Gazebo/TurtleBot3 bridge expects TwistStamped -> use_stamped_cmd_vel:=true
+  * ROBOT (Humble): our motor bridge expects plain Twist          -> use_stamped_cmd_vel:=false  (default)
+
+Team rule: sim = TwistStamped, hardware = Twist, and this node takes the flag so
+neither side has to be rewritten.
+
+Run examples:
+  ros2 run obstacle_avoidance avoider                                          # default: Twist (hardware)
+  ros2 run obstacle_avoidance avoider --ros-args -p use_stamped_cmd_vel:=true  # sim
+-----------------------------------------------------------------------------
+"""
+
+import math
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import Twist, TwistStamped
+
 
 class ObstacleAvoider(Node):
     def __init__(self):
         super().__init__('obstacle_avoider')
-        self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+
+        # --- cmd_vel message type selection --------------------------------
+        # Default false (plain Twist) = hardware/Humble. Set true for sim/Jazzy.
+        self.declare_parameter('use_stamped_cmd_vel', False)
+        self.use_stamped = self.get_parameter('use_stamped_cmd_vel').value
+
+        msg_type = TwistStamped if self.use_stamped else Twist
+        self.publisher = self.create_publisher(msg_type, '/cmd_vel', 10)
+
         self.subscription = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, 10)
 
-        # Tunable parameters
-        self.forward_speed = 0.6      # m/s when path is clear
-        self.turn_speed = 0.5         # rad/s when avoiding
-        self.stop_distance = 0.4      # m: obstacle threshold ahead
-        self.front_arc = 30           # degrees: half-width of the front cone
-        self.side_arc = 60            # degrees: width of each side sector
+        # --- Tunable parameters --------------------------------------------
+        self.forward_speed = 0.2     # m/s when path is clear
+        self.turn_speed = 0.5        # rad/s when avoiding
+        self.stop_distance = 0.4     # m: obstacle threshold ahead
+        self.front_arc = 30.0        # deg: half-width of the front cone
+        self.side_arc = 60.0         # deg: width of each side sector beyond the front
 
-        self.get_logger().info('Obstacle avoider started')
+        self.get_logger().info(
+            'Obstacle avoider started (cmd_vel type: %s)'
+            % ('TwistStamped' if self.use_stamped else 'Twist'))
 
-    def sector_min(self, ranges, start_deg, end_deg, num_readings):
-        """Minimum valid range within an angular sector (degrees)."""
-        deg_per_reading = 360.0 / num_readings
-        start_i = int(start_deg / deg_per_reading) % num_readings
-        end_i = int(end_deg / deg_per_reading) % num_readings
+    def sector_min(self, msg, low_deg, high_deg):
+        """
+        Minimum valid range among readings whose angle falls in [low_deg, high_deg].
+        Works for any scan resolution by mapping each index to its real angle via
+        angle_min / angle_increment, rather than assuming a fixed array size.
+        Returns inf if no valid reading falls in the sector.
+        """
+        low = math.radians(low_deg)
+        high = math.radians(high_deg)
+        best = float('inf')
 
-        if start_i <= end_i:
-            sector = ranges[start_i:end_i + 1]
-        else:  # wraps past 0
-            sector = ranges[start_i:] + ranges[:end_i + 1]
+        for i, r in enumerate(msg.ranges):
+            angle = msg.angle_min + i * msg.angle_increment
+            # Normalise to [-pi, pi] for consistent comparison.
+            angle = math.atan2(math.sin(angle), math.cos(angle))
+            if low <= angle <= high:
+                if msg.range_min < r < msg.range_max and not math.isinf(r) and not math.isnan(r):
+                    if r < best:
+                        best = r
+        return best
 
-        valid = [r for r in sector if 0.1 < r < 3.5]
-        return min(valid) if valid else float('inf')
+    def make_cmd(self, linear_x, angular_z):
+        """Build the correct message type with the given velocities."""
+        if self.use_stamped:
+            cmd = TwistStamped()
+            cmd.header.stamp = self.get_clock().now().to_msg()
+            cmd.twist.linear.x = linear_x
+            cmd.twist.angular.z = angular_z
+            return cmd
+        else:
+            cmd = Twist()
+            cmd.linear.x = linear_x
+            cmd.angular.z = angular_z
+            return cmd
 
     def scan_callback(self, msg):
-        cmd = TwistStamped()
-        cmd.header.stamp = self.get_clock().now().to_msg()
+        # Front cone: front_arc degrees either side of straight ahead.
+        front = self.sector_min(msg, -self.front_arc, self.front_arc)
 
-        ranges = msg.ranges
-        n = len(ranges)
-
-        # Front cone: front_arc degrees either side of straight ahead (index 0)
-        front = min(
-            self.sector_min(ranges, 0, self.front_arc, n),
-            self.sector_min(ranges, 360 - self.front_arc, 360, n),
-        )
-
-        # Left and right sectors for choosing turn direction
-        left = self.sector_min(ranges, self.front_arc, self.front_arc + self.side_arc, n)
-        right = self.sector_min(ranges, 360 - self.front_arc - self.side_arc, 360 - self.front_arc, n)
+        # Side sectors for choosing turn direction.
+        left = self.sector_min(msg, -self.front_arc - self.side_arc, -self.front_arc)
+        right = self.sector_min(msg, self.front_arc, self.front_arc + self.side_arc)
 
         if front < self.stop_distance:
-            # Obstacle ahead — turn toward whichever side has more space
-            cmd.twist.linear.x = 0.0
+            # Obstacle ahead — turn toward whichever side has more clearance.
             if left > right:
-                cmd.twist.angular.z = self.turn_speed   # turn left
+                cmd = self.make_cmd(0.0, self.turn_speed)    # more room left -> turn left
             else:
-                cmd.twist.angular.z = -self.turn_speed  # turn right
+                cmd = self.make_cmd(0.0, -self.turn_speed)   # more room right -> turn right
         else:
-            # Path clear — drive forward
-            cmd.twist.linear.x = self.forward_speed
-            cmd.twist.angular.z = 0.0
+            # Path clear — drive forward.
+            cmd = self.make_cmd(self.forward_speed, 0.0)
 
         self.publisher.publish(cmd)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -70,6 +126,7 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
