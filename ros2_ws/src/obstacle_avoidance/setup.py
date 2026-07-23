@@ -23,7 +23,11 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts': ['avoider = obstacle_avoidance.avoider:main',
+        'console_scripts': [
+            'avoider = obstacle_avoidance.avoider:main',
+            'motor_serial_bridge = obstacle_avoidance.motor_serial_bridge:main',
+    ],
+
         ],
     },
 )
