@@ -22,10 +22,11 @@ setup(
             'pytest',
         ],
     },
-    entry_points={
+     entry_points={
         'console_scripts': [
             'avoider = obstacle_avoidance.avoider:main',
             'motor_serial_bridge = obstacle_avoidance.motor_serial_bridge:main',
+            'scan_serial_bridge = obstacle_avoidance.scan_serial_bridge:main',
         ],
     },
 )
