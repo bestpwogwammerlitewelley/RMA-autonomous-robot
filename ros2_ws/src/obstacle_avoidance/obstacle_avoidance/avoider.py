@@ -54,8 +54,8 @@ class ObstacleAvoider(Node):
             LaserScan, '/scan', self.scan_callback, 10)
 
         # --- Tunable parameters --------------------------------------------
-        self.forward_speed = 0.2     # m/s when path is clear
-        self.turn_speed = 0.5        # rad/s when avoiding
+        self.forward_speed = 0.1     # m/s when path is clear
+        self.turn_speed = 0.3        # rad/s when avoiding
         self.stop_distance = 0.4     # m: obstacle threshold ahead
         self.front_arc = 30.0        # deg: half-width of the front cone
         self.side_arc = 60.0         # deg: width of each side sector beyond the front
